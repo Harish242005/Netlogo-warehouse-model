@@ -52,6 +52,8 @@ The model includes:
 
 ## 🏭 Warehouse Zones
 
+![Work Layout](work-layout.png)
+
 The warehouse layout includes:
 
 - **INFEED**
@@ -87,6 +89,129 @@ This makes movement more stable when many agents attempt to use the same shared 
 
 ### 5. Recovery Logic
 If collisions or battery depletion occur, vehicles may be queued, towed, repaired, charged, and returned to operation.
+
+---
+
+## 🧠 System Architecture & Execution Model
+
+![System Architecture](System architecture.png)
+
+The warehouse simulation is structured as a layered, agent-based system running on the NetLogo Web runtime (single execution thread with logical concurrency).
+
+Rather than using true multi-threading, the model implements cooperative scheduling through a structured execution cycle:
+
+**plan → resolve → commit**
+
+This ensures fair movement, prevents race conditions, and stabilizes shared resource conflicts inside corridors and zones.
+
+---
+
+### 🟦 Layer 1: Agent Layer
+
+The system contains multiple autonomous agent types:
+
+- 🚚 Inbound Trucks — unload pallets into BLUE zone
+- 🚗 Transfer Cars — move pallets BLUE → READY
+- 🚛 Outbound Carriers — move READY → OUTFEED
+- 👷 Humans — assist sorting, staging, and handling
+- 🛠️ Repair Tows — recover broken vehicles
+- 🔋 Charge Tows — recover battery-depleted vehicles
+
+Each agent maintains internal state, battery level, task phase, and movement intent.
+
+Agents operate independently but interact through shared spatial constraints.
+
+---
+
+### 🟨 Layer 2: Behaviour & Interaction Rules
+
+This layer defines the operational logic governing the warehouse.
+
+#### Task State Machines
+Each pallet and vehicle progresses through defined states:
+
+- inbound → unload → pick → ready → dispatch
+- working → charging → broken → recovered
+
+Timers regulate:
+- inbound unload time
+- sort time
+- service time
+- charge time
+
+#### Interaction Constraints
+
+The model enforces:
+
+- 🚧 Corridor capacity limits (max-items-per-patch)
+- 🚫 Collision probability logic
+- 🔄 Recovery queues for breakdowns
+- ⚡ Battery drain per tick
+- 🔧 Tow dispatch rules (broken → service, dead → charge)
+
+All movement conflicts are resolved during the **resolve phase** before committing updates.
+
+---
+
+### 🟩 Layer 3: Environment Layer
+
+The warehouse environment consists of:
+
+- Patch grid (spatial topology)
+- Functional zones:
+  - INFEED
+  - BLUE
+  - READY
+  - OUTFEED
+  - SERVICE
+  - CHARGE
+  - REST
+  - PARK
+- Corridors and obstacle constraints
+- Pallet objects as transferable resources
+
+Zones impose functional rules that shape flow and congestion dynamics.
+
+---
+
+## 🔄 Logical Concurrency Model
+
+Although NetLogo Web runs in a single execution thread, the system simulates multi-agent concurrency through staged updates:
+
+1. Agents read environment state
+2. Agents compute intended movement
+3. Conflicts are resolved centrally
+4. Valid moves are committed simultaneously
+
+This prevents:
+
+- unfair movement bias
+- overlapping collisions
+- starvation of slower agents
+- inconsistent zone occupancy
+
+The result is stable cooperative scheduling under high agent density.
+
+---
+
+## 📈 KPI & Termination Logic
+
+Simulation stops when:
+
+- delivery target is achieved
+- system is drained
+- maximum ticks reached
+
+Key KPIs include:
+
+- Throughput (deliveries per tick)
+- Congestion (mean & max blocked)
+- Battery health (mean & minimum)
+- Human utilization
+- WIP levels (BLUE, READY, carrying)
+- Recovery queue lengths
+
+These metrics enable operational analysis and scenario benchmarking.
 
 ---
 
@@ -203,6 +328,30 @@ Another important business insight is that **reliability affects flow beyond the
 ---
 
 ## 📊 Final Results
+
+### 🚧 Congestion Analysis
+![Congestion](congestion.png)
+
+### 🔋 Battery Performance
+![Battery](battery.png)
+
+### 🚚 Fleet Status
+![Fleet Status](fleet-status.png)
+
+### 📦 Work In Progress (WIP)
+![WIP](Work in Progress.png)
+
+### 👷 Human Utilization
+![Human Utilization](human-utilization.png)
+
+### 🎯 Target Progress
+![Target Progress](target-progress.png)
+
+### 📈 Delivery Progress
+![Delivery Progress](delivery-progress.png)
+
+### 🛠️ Tow & Recovery Queues
+![Tow Queues](tow-queues.png)
 
 ### Sample Run Summary
 - **Final Deliveries:** 50
