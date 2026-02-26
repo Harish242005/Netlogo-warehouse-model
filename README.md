@@ -380,7 +380,7 @@ These results support the project objective of using agent-based simulation to i
 
 This model has been reviewed and approved within the NetLogo ecosystem.
 
-![NetLogo Approved](netlogo-approved-image.png)
+![NetLogo Approved](Netlogo-approved-image.png)
 
 The approval confirms that the model:
 - Runs correctly in NetLogo
