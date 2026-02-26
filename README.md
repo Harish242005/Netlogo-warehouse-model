@@ -339,7 +339,7 @@ Another important business insight is that **reliability affects flow beyond the
 ![Fleet Status](fleet-status.png)
 
 ### 📦 Work In Progress (WIP)
-![WIP](Work-in-progess.png)
+![WIP](Work-in-Progess.png)
 
 ### 👷 Human Utilization
 ![Human Utilization](human-utilization.png)
