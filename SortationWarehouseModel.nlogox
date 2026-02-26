@@ -1,0 +1,2800 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<model version="NetLogo 7.0.0-beta0" snapToGrid="false">
+  <code><![CDATA[; ==========================================================
+; SORTATION WAREHOUSE (NETLOGO WEB SAFE) + CONGESTION METRICS
+; ----------------------------------------------------------
+; Inbound trucks  = RED   (unload pallets into BLUE zone)   [finite supply]
+; Transfer cars   = GREY  (move pallets BLUE -> READY)
+; Humans          = PINK  (assist sorting, stay in BLUE normally)
+; Outbound carriers = GREEN (move pallets READY -> OUTFEED doors)
+;
+; Collisions can happen on FLOOR corridors (if enabled).
+; Broken vehicles are towed by BUGs to SERVICE for repair.
+; Dead vehicles (battery = 0) are towed by TURTLES to CHARGE to revive.
+; After charge/repair, vehicles RESUME their jobs (restore-vehicle-job).
+;
+; NOTE:
+; - NetLogo Web: do plots in Interface (not via code).
+; - Congestion metrics go into globals:
+;     mean-blocked-now, max-blocked-now
+; ==========================================================
+
+; ---------------------------
+; BREEDS
+; ---------------------------
+breed [inbound-trucks inbound-truck]
+breed [carriers carrier]
+breed [transfer-cars transfer-car]
+breed [humans human]
+breed [repair-tows repair-tow]
+breed [charge-tows charge-tow]
+
+; ---------------------------
+; GLOBAL STATE
+; ---------------------------
+globals [
+  deliveries
+
+  toilet-zone
+  door-spacing
+  ready-zone-color
+
+  ; congestion monitors
+  mean-blocked-now
+  max-blocked-now
+
+  infeed-bays
+  outfeed-bays
+
+  blue-zone
+  ready-zone
+
+  
+  last-mouse-down?
+  last-mouse-patch
+
+  service-stations
+  charge-stations
+  charge-lot
+
+  broken-queue
+  dead-queue
+
+  target-reached?
+  shutdown-tick
+
+  initial-pallets
+  deliveries-log
+
+  ; --- publish / diagnostics metrics
+  pallet-births
+  lead-times
+  lead-window
+
+  moved-by-humans
+  moved-by-transfer
+
+  
+ 
+]
+
+; ---------------------------
+; PATCH STATE
+; ---------------------------
+patches-own [
+  celltype
+  wall?
+  items
+  ready?
+]
+
+; ---------------------------
+; TURTLE STATE
+; ---------------------------
+turtles-own [
+  mstate
+  goal-patch
+  path
+  reserved-next
+  blocked-steps
+
+  battery
+  service-left
+  charge-left
+
+  carry?
+  work-left
+]
+
+repair-tows-own [
+  tstate
+  target-truck
+  goal2
+  path2
+  blocked2
+]
+
+charge-tows-own [
+  tstate
+  target-truck
+  goal2
+  path2
+  blocked2
+]
+
+; ==========================================================
+; SETUP
+; ==========================================================
+to setup
+  clear-all
+
+  set door-spacing 2
+  set ready-zone-color violet
+  set deliveries 0
+
+  set broken-queue []
+  set dead-queue []
+
+  set target-reached? false
+  set shutdown-tick -1
+
+  set deliveries-log []
+
+  ; --- publish diagnostics
+  set pallet-births []
+  set lead-times []
+  set lead-window 200
+  set moved-by-humans 0
+  set moved-by-transfer 0
+
+  ; --- reproducibility (optional)
+  if not is-boolean? use-fixed-seed? [ set use-fixed-seed? false ]
+  if not is-number? seed [ set seed 12345 ]
+  if use-fixed-seed? [ random-seed seed ]
+
+  ; --- slider safety
+  if not is-number? robot-speed            [ set robot-speed 2 ]
+  if robot-speed <= 0                      [ set robot-speed 2 ]
+
+  if not is-number? collision-prob         [ set collision-prob 0.01 ]
+  if collision-prob < 0                    [ set collision-prob 0.01 ]
+
+  if not is-number? max-ticks              [ set max-ticks 0 ]
+  if max-ticks < 0                         [ set max-ticks 0 ]
+
+  if not is-number? battery-max            [ set battery-max 2000 ]
+  if battery-max <= 0                      [ set battery-max 2000 ]
+
+  if not is-number? battery-drain-per-tick [ set battery-drain-per-tick 2 ]
+  if battery-drain-per-tick < 0            [ set battery-drain-per-tick 2 ]
+
+  if not is-number? charge-time            [ set charge-time 25 ]
+  if charge-time <= 0                      [ set charge-time 25 ]
+
+  if not is-number? service-time           [ set service-time 35 ]
+  if service-time <= 0                     [ set service-time 35 ]
+
+  if not is-number? sort-time              [ set sort-time 2 ]
+  if sort-time <= 0                        [ set sort-time 2 ]
+
+  if not is-number? inbound-unload-time    [ set inbound-unload-time 3 ]
+  if inbound-unload-time <= 0              [ set inbound-unload-time 3 ]
+
+  if not is-number? max-items-per-patch    [ set max-items-per-patch 6 ]
+  if max-items-per-patch <= 0              [ set max-items-per-patch 6 ]
+
+  if not is-number? inbound-pallets-left   [ set inbound-pallets-left 500 ]
+  if inbound-pallets-left < 0              [ set inbound-pallets-left 500 ]
+
+  set initial-pallets inbound-pallets-left
+
+  if not is-number? deliveries-target      [ set deliveries-target 0 ]
+  if deliveries-target < 0                 [ set deliveries-target 0 ]
+  if deliveries-target > initial-pallets   [ set deliveries-target initial-pallets ]
+
+  if not is-number? target-loss-count      [ set target-loss-count 4 ]
+  if target-loss-count < 0                 [ set target-loss-count 0 ]
+
+  if not is-boolean? enable-battery?       [ set enable-battery? true ]
+  if not is-boolean? enable-collisions?    [ set enable-collisions? true ]
+
+  if not is-string? mouse-tool             [ set mouse-tool "none" ]
+  set last-mouse-down? false
+  set last-mouse-patch nobody
+
+  if not is-number? num-inbound-trucks     [ set num-inbound-trucks 10 ]
+  if num-inbound-trucks < 0                [ set num-inbound-trucks 0 ]
+
+  if not is-number? num-carriers           [ set num-carriers 14 ]
+  if num-carriers < 0                      [ set num-carriers 0 ]
+
+  if not is-number? num-transfer-cars      [ set num-transfer-cars 6 ]
+  if num-transfer-cars < 0                 [ set num-transfer-cars 0 ]
+
+  if not is-number? num-humans             [ set num-humans 8 ]
+  if num-humans < 0                        [ set num-humans 0 ]
+
+  if not is-number? num-repair-tows        [ set num-repair-tows 1 ]
+  if num-repair-tows < 0                   [ set num-repair-tows 0 ]
+
+  if not is-number? num-charge-tows        [ set num-charge-tows 2 ]
+  if num-charge-tows < 0                   [ set num-charge-tows 0 ]
+
+  setup-layout
+  setup-agents
+
+  set mean-blocked-now 0
+  set max-blocked-now 0
+
+  reset-ticks
+end
+
+; ==========================================================
+; MAIN LOOP
+; ==========================================================
+to go
+  if (max-ticks > 0) and (ticks >= max-ticks) [ stop ]
+
+  if not enable-battery? [
+    ask (turtle-set inbound-trucks carriers transfer-cars) [
+      set battery battery-max
+    ]
+  ]
+
+  handle-mouse
+  service-and-charge-timers
+
+  inbound-logic
+  human-sorting-logic
+  transfer-logic
+  carrier-logic
+
+  plan-all-vehicle-steps
+  resolve-collisions
+  move-all-vehicles
+
+  move-repair-tows
+  move-charge-tows
+
+  ask (turtle-set inbound-trucks carriers transfer-cars) [
+    update-vehicle-appearance
+  ]
+
+  update-monitors
+
+  set deliveries-log lput deliveries deliveries-log
+  if length deliveries-log > 51 [ set deliveries-log but-first deliveries-log ]
+
+  if system-done? [
+    if not target-reached? [
+      set target-reached? true
+      set shutdown-tick ticks
+      finish-and-shutdown
+    ]
+
+    let vehicles (turtle-set inbound-trucks carriers transfer-cars)
+    if (not any? vehicles with [not member? mstate ["charging" "parked"]]) and
+       (not any? humans with [mstate != "resting"])
+    [
+      stop
+    ]
+  ]
+
+  tick
+end
+
+to-report target-met?
+  let eff-target effective-delivery-target
+  report (eff-target > 0 and deliveries >= eff-target)
+end
+
+to-report system-drained?
+  if inbound-pallets-left > 0 [ report false ]
+  if any? blue-zone with [items > 0] [ report false ]
+  if any? ready-zone with [items > 0] [ report false ]
+  if any? (turtle-set inbound-trucks carriers transfer-cars) with [carry?] [ report false ]
+  report true
+end
+
+; ==========================================================
+; INTERACTIVE MOUSE HANDLER
+; ==========================================================
+to handle-mouse
+  if not mouse-down? [
+    set last-mouse-down? false
+    set last-mouse-patch nobody
+  ]
+
+  if mouse-down? [
+    let p patch mouse-xcor mouse-ycor
+    if p != nobody [
+      if (not last-mouse-down?) or (p != last-mouse-patch) [
+        set last-mouse-down? true
+        set last-mouse-patch p
+
+        if mouse-tool = "toggle-wall" [
+          ask p [
+            if not (pxcor = min-pxcor or pxcor = max-pxcor or
+                    pycor = min-pycor or pycor = max-pycor) [
+              if celltype = "floor" [
+                set wall? true
+                set celltype "wall"
+                set pcolor gray
+              ]
+              if celltype = "wall" [
+                set wall? false
+                set celltype "floor"
+                set pcolor 7
+              ]
+            ]
+          ]
+        ]
+
+        if mouse-tool = "add-items-blue" [
+          if [celltype] of p = "blue" [
+            ask p [ set items min list max-items-per-patch (items + 1) ]
+          ]
+        ]
+
+        if mouse-tool = "remove-items" [
+          ask p [ set items max list 0 (items - 1) ]
+        ]
+
+        if mouse-tool = "add-inbound" [
+          if (not [wall?] of p) and not any? turtles-on p [
+            create-inbound-trucks 1 [
+              init-vehicle "to-infeed"
+              safe-move-to p
+              update-vehicle-appearance
+            ]
+          ]
+        ]
+
+        if mouse-tool = "add-transfer" [
+          if (not [wall?] of p) and not any? turtles-on p [
+            create-transfer-cars 1 [
+              init-vehicle "idle"
+              set shape "car"
+              set color gray
+              set label "T"
+              safe-move-to p
+              update-vehicle-appearance
+            ]
+          ]
+        ]
+
+        if mouse-tool = "add-carrier" [
+          if (not [wall?] of p) and not any? turtles-on p [
+            create-carriers 1 [
+              init-vehicle "idle"
+              safe-move-to p
+              update-vehicle-appearance
+            ]
+          ]
+        ]
+
+        let v one-of (turtle-set inbound-trucks carriers transfer-cars) with [patch-here = p]
+        if v != nobody [
+          if mouse-tool = "break-vehicle" [
+            ask v [ become-broken update-vehicle-appearance ]
+          ]
+
+          if mouse-tool = "kill-battery" [
+            ask v [
+              if enable-battery? [
+                set battery 0
+                become-dead
+                update-vehicle-appearance
+              ]
+            ]
+          ]
+
+          if mouse-tool = "repair-now" [
+            ask v [
+              set mstate "servicing"
+              set service-left 1
+            ]
+          ]
+
+          if mouse-tool = "charge-now" [
+            ask v [
+              set mstate "charging"
+              set charge-left 1
+              set battery battery-max
+            ]
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+; ==========================================================
+; LAYOUT
+; ==========================================================
+to setup-layout
+  ask patches [
+    set celltype "floor"
+    set pcolor 7
+    set wall? false
+    set items 0
+    set ready? false
+    set plabel ""
+  ]
+
+  ask patches with [
+    pxcor = min-pxcor or pxcor = max-pxcor or
+    pycor = min-pycor or pycor = max-pycor
+  ] [
+    set wall? true
+    set celltype "wall"
+    set pcolor gray
+  ]
+
+  set infeed-bays patches with [
+    pxcor = min-pxcor + 1 and (pycor mod door-spacing = 0) and not wall?
+  ]
+  set outfeed-bays patches with [
+    pxcor = max-pxcor - 1 and (pycor mod door-spacing = 0) and not wall?
+  ]
+  ask infeed-bays  [ set celltype "infeed"  set pcolor red   ]
+  ask outfeed-bays [ set celltype "outfeed" set pcolor green ]
+
+  set blue-zone patches with [
+    pxcor >= -10 and pxcor <= -2 and
+    pycor >= -8  and pycor <= 8 and
+    celltype = "floor" and not wall?
+  ]
+  ask blue-zone [ set celltype "blue" set pcolor blue ]
+
+  set ready-zone patches with [
+    pxcor >= 3 and pxcor <= 11 and
+    pycor >= -8 and pycor <= 8 and
+    celltype = "floor" and not wall?
+  ]
+  ask ready-zone [ set celltype "ready" set pcolor ready-zone-color ]
+
+  let zoneH 4
+  let bottom-y1 (min-pycor + 2)
+  let bottom-y2 (bottom-y1 + zoneH - 1)
+
+  let zoneW 5
+  let gapW 2
+  let tripleW (3 * zoneW + 2 * gapW)
+
+  let centerX round ((min-pxcor + max-pxcor) / 2)
+  let leftX (centerX - int (tripleW / 2))
+
+  let sL leftX
+  let sR (sL + zoneW - 1)
+
+  let tL (sR + gapW + 1)
+  let tR (tL + zoneW - 1)
+
+  let cL (tR + gapW + 1)
+  let cR (cL + zoneW - 1)
+
+  set service-stations patches with [
+    pxcor >= sL and pxcor <= sR and
+    pycor >= bottom-y1 and pycor <= bottom-y2 and
+    celltype = "floor" and not wall? and
+    pxcor != (min-pxcor + 1) and pxcor != (max-pxcor - 1)
+  ]
+  ask service-stations [
+    set celltype "service"
+    set pcolor orange
+  ]
+
+  set toilet-zone patches with [
+    pxcor >= tL and pxcor <= tR and
+    pycor >= bottom-y1 and pycor <= bottom-y2 and
+    celltype = "floor" and not wall? and
+    pxcor != (min-pxcor + 1) and pxcor != (max-pxcor - 1)
+  ]
+  ask toilet-zone [
+    set celltype "rest"
+    set pcolor 25
+  ]
+
+  set charge-stations patches with [
+    pxcor >= cL and pxcor <= cR and
+    pycor >= bottom-y1 and pycor <= bottom-y2 and
+    celltype = "floor" and not wall? and
+    pxcor != (min-pxcor + 1) and pxcor != (max-pxcor - 1)
+  ]
+  ask charge-stations [
+    set celltype "charge"
+    set pcolor yellow
+  ]
+
+  let parkH 3
+  let top-y2 (max-pycor - 2)
+  let top-y1 (top-y2 - parkH - 1 + 1)
+
+  set charge-lot patches with [
+    pxcor >= (centerX - 4) and pxcor <= (centerX + 4) and
+    pycor >= top-y1 and pycor <= top-y2 and
+    celltype = "floor" and not wall?
+  ]
+  ask charge-lot [
+    set celltype "charge-lot"
+    set pcolor 53
+  ]
+
+  label-doors-and-zones
+end
+
+to label-doors-and-zones
+  ask patches [ set plabel "" ]
+
+  let inlist sort-by [[a b] -> [pycor] of a < [pycor] of b] (sort infeed-bays)
+  let n 1
+  foreach inlist [p ->
+    ask p [ set plabel (word "IN" n) set plabel-color white ]
+    set n n + 1
+  ]
+
+  let outlist sort-by [[a b] -> [pycor] of a < [pycor] of b] (sort outfeed-bays)
+  set n 1
+  foreach outlist [p ->
+    ask p [ set plabel (word "OUT" n) set plabel-color white ]
+    set n n + 1
+  ]
+
+  if any? blue-zone [
+    let bx round mean [pxcor] of blue-zone
+    let by max [pycor] of blue-zone
+    ask patch bx by [ set plabel "BLUE" set plabel-color white ]
+  ]
+
+  if any? ready-zone [
+    let rx round mean [pxcor] of ready-zone
+    let ry max [pycor] of ready-zone
+    ask patch rx ry [ set plabel "READY" set plabel-color white ]
+  ]
+
+  if any? service-stations [
+    let sx round mean [pxcor] of service-stations
+    let sy max [pycor] of service-stations
+    ask patch sx sy [ set plabel "SERVICE" set plabel-color white ]
+  ]
+
+  if any? charge-stations [
+    let cx round mean [pxcor] of charge-stations
+    let cy max [pycor] of charge-stations
+    ask patch cx cy [ set plabel "CHARGE" set plabel-color black ]
+  ]
+
+  if any? charge-lot [
+    let px round mean [pxcor] of charge-lot
+    let py min [pycor] of charge-lot + 1
+    ask patch px py [ set plabel "PARK" set plabel-color black ]
+  ]
+
+  if any? toilet-zone [
+    let tx round mean [pxcor] of toilet-zone
+    let ty max [pycor] of toilet-zone
+    ask patch tx ty [ set plabel "REST AREA" set plabel-color white ]
+  ]
+end
+
+; ==========================================================
+; AGENT CREATION
+; ==========================================================
+to setup-agents
+  create-inbound-trucks num-inbound-trucks [
+    init-vehicle "to-infeed"
+    safe-move-to (safe-one-of-patches (patches with [celltype = "floor" and not wall? and not any? turtles-here]))
+    update-vehicle-appearance
+  ]
+
+  create-carriers num-carriers [
+    init-vehicle "idle"
+    safe-move-to (safe-one-of-patches (patches with [celltype = "floor" and not wall? and not any? turtles-here]))
+    update-vehicle-appearance
+  ]
+
+  create-transfer-cars num-transfer-cars [
+    init-vehicle "idle"
+    set shape "car"
+    set color gray
+    set label "T"
+    safe-move-to (safe-one-of-patches (patches with [celltype = "floor" and not wall? and not any? turtles-here]))
+    update-vehicle-appearance
+  ]
+
+  create-humans num-humans [
+    set size 1.1
+    set shape "person"
+    set color pink
+    set label ""
+    set mstate "sorting"
+    set goal-patch nobody
+    set path []
+    set reserved-next nobody
+    set blocked-steps 0
+    set carry? false
+    set work-left 0
+    safe-move-to (safe-one-of-patches (blue-zone with [not any? turtles-here]))
+  ]
+
+  create-repair-tows num-repair-tows [
+    set size 1.0
+    set shape "bug"
+    set color red
+    set label "S"
+    set tstate "idle"
+    set target-truck nobody
+    set goal2 nobody
+    set path2 []
+    set blocked2 0
+    safe-move-to (safe-one-of-patches service-stations)
+  ]
+
+  create-charge-tows num-charge-tows [
+    set size 1.0
+    set shape "turtle"
+    set color violet
+    set label "C"
+    set tstate "idle"
+    set target-truck nobody
+    set goal2 nobody
+    set path2 []
+    set blocked2 0
+    safe-move-to (safe-one-of-patches charge-stations)
+  ]
+end
+
+to init-vehicle [initial-state]
+  set size 1.2
+  set mstate initial-state
+  set goal-patch nobody
+  set path []
+  set reserved-next nobody
+  set blocked-steps 0
+  set battery battery-max
+  set service-left 0
+  set charge-left 0
+  set carry? false
+  set work-left 0
+end
+
+; ==========================================================
+; BATTERY POLICY
+; ==========================================================
+to-report low-battery?
+  report enable-battery? and (battery <= (0.15 * battery-max))
+end
+
+to maybe-go-charge
+  if not enable-battery? [ stop ]
+  if member? mstate ["charging" "to-charge-home" "towed-to-charge" "dead" "broken" "servicing" "parked"] [ stop ]
+  if not low-battery? [ stop ]
+  let c safe-one-of-patches charge-stations
+  if c != nobody [
+    set goal-patch c
+    set path find-path patch-here goal-patch
+    set mstate "to-charge-home"
+  ]
+end
+
+; ==========================================================
+; INBOUND LOGIC
+; ==========================================================
+to inbound-logic
+  ask inbound-trucks [
+    if is-stopped-vehicle? self [ stop ]
+    if enable-battery? and battery <= 0 [ become-dead stop ]
+
+    maybe-go-charge
+    if mstate = "to-charge-home" [
+      if goal-patch != nobody and patch-here = goal-patch [
+        set mstate "charging"
+        set charge-left charge-time
+      ]
+      stop
+    ]
+
+    if inbound-pallets-left <= 0 [
+      set mstate "idle"
+      set goal-patch nobody
+      set path []
+      stop
+    ]
+
+    if mstate = "to-infeed" [
+      let door safe-one-of-patches infeed-bays
+      if door != nobody [
+        set goal-patch door
+        set path find-path patch-here goal-patch
+        set mstate "to-infeed-driving"
+      ]
+      stop
+    ]
+
+    if mstate = "to-infeed-driving" [
+      if patch-here = goal-patch [
+        let b safe-one-of-patches blue-zone
+        if b != nobody [
+          set goal-patch b
+          set path find-path patch-here goal-patch
+          set mstate "to-blue"
+        ]
+      ]
+      stop
+    ]
+
+    if mstate = "to-blue" [
+      if patch-here = goal-patch [
+        set mstate "unloading"
+        set work-left inbound-unload-time
+      ]
+      stop
+    ]
+
+    if mstate = "unloading" [
+      set work-left work-left - 1
+      if work-left <= 0 [
+        if inbound-pallets-left > 0 [
+
+          
+          ifelse [items] of patch-here < max-items-per-patch [
+
+            ask patch-here [
+              set items items + 1
+              set ready? false
+              set pcolor blue
+            ]
+
+            set pallet-births lput ticks pallet-births
+            set inbound-pallets-left inbound-pallets-left - 1
+
+            set mstate "to-infeed"
+            set goal-patch nobody
+            set path []
+
+          ] [
+
+            let b safe-one-of-patches (blue-zone with [items < max-items-per-patch])
+            ifelse b != nobody [
+              set goal-patch b
+              set path find-path patch-here goal-patch
+              set mstate "to-blue"
+            ] [
+              ; wait and retry soon
+              set work-left 1
+            ]
+
+          ]
+        ]
+
+        if inbound-pallets-left <= 0 [
+          set mstate "idle"
+          set goal-patch nobody
+          set path []
+        ]
+      ]
+      stop
+    ]
+  ]
+end
+; ==========================================================
+; HUMANS: sort BLUE -> READY, rest when done
+; ==========================================================
+to human-sorting-logic
+  ask humans [
+    if mstate = "resting" [ stop ]
+
+    ; --- Sorting countdown (when carrying a pallet)
+    if work-left > 0 [
+      set work-left work-left - 1
+      if work-left <= 0 [
+        if carry? [
+          let readyspot safe-one-of-patches (ready-zone with [items < max-items-per-patch])
+          if readyspot != nobody [
+            let before [items] of readyspot
+            ask readyspot [
+              if items < max-items-per-patch [
+                set items items + 1
+                set ready? true
+                set pcolor 45
+              ]
+            ]
+            if [items] of readyspot > before [
+              set carry? false
+              set moved-by-humans moved-by-humans + 1
+            ]
+          ]
+        ]
+      ]
+      stop
+    ]
+
+    ; --- Finished sorting but READY was full -> keep trying to drop (do NOT re-sort)
+    if carry? and work-left <= 0 [
+      let readyspot safe-one-of-patches (ready-zone with [items < max-items-per-patch])
+      if readyspot != nobody [
+        let before [items] of readyspot
+        ask readyspot [
+          if items < max-items-per-patch [
+            set items items + 1
+            set ready? true
+            set pcolor 45
+          ]
+        ]
+        if [items] of readyspot > before [
+          set carry? false
+          set moved-by-humans moved-by-humans + 1
+        ]
+      ]
+      stop
+    ]
+
+    ; --- Resting logic (target reached)
+    if deliveries-target > 0
+       and deliveries >= effective-delivery-target
+       and work-left <= 0
+       and not carry? [
+
+      if [celltype] of patch-here = "rest" [
+        set mstate "resting"
+        stop
+      ]
+
+      let t safe-one-of-patches toilet-zone
+      if t != nobody [
+        set goal-patch t
+        set path find-path patch-here goal-patch
+        step-along-path-safe
+      ]
+
+      if [celltype] of patch-here = "rest" [
+        set mstate "resting"
+      ]
+      stop
+    ]
+
+    ; --- Resting logic (system done)
+    if system-done? and work-left <= 0 and not carry? [
+      if [celltype] of patch-here != "rest" [
+        let t safe-one-of-patches toilet-zone
+        if t != nobody [ safe-move-to t ]
+      ]
+      set mstate "resting"
+      stop
+    ]
+
+    ; --- Keep humans in BLUE zone
+    if [celltype] of patch-here != "blue" [
+      let b safe-one-of-patches (blue-zone with [not any? turtles-here])
+      if b != nobody [ safe-move-to b ]
+      stop
+    ]
+
+    ; --- Yield to a transfer-car that is about to enter this patch
+    let blocker one-of transfer-cars with [
+      mstate = "to-blue" and not empty? path and first path = [patch-here] of myself
+    ]
+    if blocker != nobody [
+      let opts neighbors with [celltype = "blue" and not any? turtles-here]
+      if any? opts [
+        let dest max-one-of opts [distance blocker]
+        safe-move-to dest
+      ]
+      stop
+    ]
+
+    ; --- Pick from BLUE and start sorting
+    if not carry? [
+      let src safe-one-of-patches (blue-zone with [items > 0])
+      if src != nobody [
+        set goal-patch src
+        set path find-path patch-here goal-patch
+        step-along-path-safe
+
+        if patch-here = goal-patch [
+          ask patch-here [
+            set items items - 1
+            if items < 0 [ set items 0 ]
+          ]
+          set carry? true
+          set work-left sort-time
+        ]
+      ]
+      stop
+    ]
+  ]
+end
+
+; ==========================================================
+; TRANSFER CARS: BLUE -> READY
+; ==========================================================
+to transfer-logic
+  ask transfer-cars [
+    if is-stopped-vehicle? self [ stop ]
+    if enable-battery? and battery <= 0 [ become-dead stop ]
+
+    maybe-go-charge
+    if mstate = "to-charge-home" [
+      if goal-patch != nobody and patch-here = goal-patch [
+        set mstate "charging"
+        set charge-left charge-time
+      ]
+      stop
+    ]
+
+    if mstate = "idle" [
+      let src safe-one-of-patches (blue-zone with [items > 0])
+      if src != nobody [
+        set goal-patch src
+        set path find-path patch-here goal-patch
+        set mstate "to-blue"
+      ]
+      stop
+    ]
+
+    if mstate = "to-blue" [
+      if patch-here = goal-patch [
+        let dst safe-one-of-patches (ready-zone with [items < max-items-per-patch])
+
+        ifelse (dst != nobody) and ([items] of patch-here > 0) [
+          ask patch-here [
+            set items items - 1
+            if items < 0 [ set items 0 ]
+          ]
+          set carry? true
+          set goal-patch dst
+          set path find-path patch-here goal-patch
+          set mstate "to-ready"
+        ] [
+          set carry? false
+          set mstate "idle"
+          set goal-patch nobody
+          set path []
+        ]
+      ]
+      stop
+    ]
+
+    if mstate = "to-ready" [
+      if goal-patch = nobody [
+        set mstate "idle"
+        set goal-patch nobody
+        set path []
+        stop
+      ]
+
+      if patch-here = goal-patch [
+        ifelse carry? [
+
+          ; ✅ FIX: this must be IFELSE (no standalone ELSE in NetLogo)
+          ifelse [items] of patch-here < max-items-per-patch [
+            ask patch-here [
+              set items items + 1
+              set ready? true
+              set pcolor 45
+            ]
+            set carry? false
+            set moved-by-transfer moved-by-transfer + 1
+          ] [
+            let dst2 safe-one-of-patches (ready-zone with [items < max-items-per-patch])
+            ifelse dst2 != nobody [
+              set goal-patch dst2
+              set path find-path patch-here goal-patch
+            ] [
+              set path []
+            ]
+          ]
+
+          set mstate "idle"
+          set goal-patch nobody
+          set path []
+
+        ] [
+
+          set mstate "idle"
+          set goal-patch nobody
+          set path []
+
+        ]
+      ]
+      stop
+    ]
+  ]
+end
+
+; ==========================================================
+; CARRIERS: READY -> OUTFEED
+; ==========================================================
+to carrier-logic
+  ask carriers [
+    if is-stopped-vehicle? self [ stop ]
+    if enable-battery? and battery <= 0 [ become-dead stop ]
+
+    maybe-go-charge
+    if mstate = "to-charge-home" [
+      if goal-patch != nobody and patch-here = goal-patch [
+        set mstate "charging"
+        set charge-left charge-time
+      ]
+      stop
+    ]
+
+    if mstate = "idle" [
+      let src safe-one-of-patches (ready-zone with [items > 0])
+      if src != nobody [
+        set goal-patch src
+        set path find-path patch-here goal-patch
+        set mstate "to-ready"
+      ]
+      stop
+    ]
+
+    if mstate = "to-ready" [
+      if goal-patch = nobody [ set mstate "idle" set path [] stop ]
+      if patch-here = goal-patch [
+        ifelse [items] of patch-here > 0 [
+          ask patch-here [
+            set items items - 1
+            if items <= 0 [
+              set items 0
+              set ready? false
+              set pcolor ready-zone-color
+            ]
+          ]
+          set carry? true
+          let out safe-one-of-patches outfeed-bays
+          ifelse out != nobody [
+            set goal-patch out
+            set path find-path patch-here goal-patch
+            set mstate "to-outfeed"
+          ] [
+            set carry? false
+            set mstate "idle"
+            set goal-patch nobody
+            set path []
+          ]
+        ] [
+          set mstate "idle"
+          set goal-patch nobody
+          set path []
+        ]
+      ]
+      stop
+    ]
+
+    if mstate = "to-outfeed" [
+      if goal-patch = nobody [ set mstate "idle" set path [] stop ]
+      if patch-here = goal-patch [
+        if carry? [
+          set deliveries deliveries + 1
+          if not empty? pallet-births [
+            let birth first pallet-births
+            set pallet-births but-first pallet-births
+            set lead-times lput (ticks - birth) lead-times
+            if length lead-times > lead-window [ set lead-times but-first lead-times ]
+          ]
+          set carry? false
+        ]
+        set mstate "idle"
+        set goal-patch nobody
+        set path []
+      ]
+      stop
+    ]
+  ]
+end
+
+; ==========================================================
+; TARGET CLAMP
+; ==========================================================
+to-report effective-delivery-target
+  if deliveries-target <= 0 [ report 0 ]
+
+  let max-target initial-pallets - target-loss-count
+  if max-target < 0 [ set max-target 0 ]
+
+  if deliveries-target > max-target [ report max-target ]
+  report deliveries-target
+end
+
+; ==========================================================
+; MOVE + COLLISION
+; ==========================================================
+to plan-all-vehicle-steps
+  ask (turtle-set inbound-trucks carriers transfer-cars) [
+    set reserved-next nobody
+    if is-stopped-vehicle? self [ stop ]
+    if (path = nobody) or empty? path [ stop ]
+    let nxt first path
+    if (nxt = nobody) or (not is-patch? nxt) [ set path [] stop ]
+    set reserved-next nxt
+  ]
+end
+
+to resolve-collisions
+  if system-done? [ stop ]
+  if not enable-collisions? [ stop ]
+
+  let movers (turtle-set inbound-trucks carriers transfer-cars)
+  let targets [reserved-next] of movers with [reserved-next != nobody and is-patch? reserved-next]
+  if empty? targets [ stop ]
+
+  let contested remove-duplicates filter [pp -> (occurrences pp targets) > 1] targets
+
+  foreach contested [pp ->
+    ifelse ([celltype] of pp = "floor") [
+      let group movers with [reserved-next = pp]
+      if any? group [
+        ifelse (random-float 1 < collision-prob) [
+          ask one-of group [ become-broken ]
+          ask group [ set reserved-next nobody ]
+        ] [
+          let winner one-of group
+          ask group with [self != winner] [ set reserved-next nobody ]
+        ]
+      ]
+    ] [
+      let group2 movers with [reserved-next = pp]
+      if any? group2 [
+        let winner2 one-of group2
+        ask group2 with [self != winner2] [ set reserved-next nobody ]
+      ]
+    ]
+  ]
+end
+
+to move-all-vehicles
+  ask (turtle-set inbound-trucks carriers transfer-cars) [
+    if is-stopped-vehicle? self [ stop ]
+
+    let moved? false
+
+    repeat robot-speed [
+      if enable-battery? and (battery <= 0) [ become-dead stop ]
+
+      if reserved-next != nobody [
+        if not is-patch? reserved-next [
+          set reserved-next nobody
+          set path []
+          stop
+        ]
+
+        ifelse (not [wall?] of reserved-next) and (not any? turtles-on reserved-next) [
+          safe-move-to reserved-next
+          set moved? true
+          if not empty? path [ set path but-first path ]
+          set blocked-steps 0
+        ] [
+          set blocked-steps blocked-steps + 1
+          let side safe-one-of-patches (neighbors4 with [not wall? and not any? turtles-here])
+          if side != nobody [
+            safe-move-to side
+            set moved? true
+          ]
+          if blocked-steps > 10 and goal-patch != nobody [
+            set path find-path patch-here goal-patch
+            set blocked-steps 0
+          ]
+        ]
+      ]
+
+      set reserved-next nobody
+      if (path != nobody) and not empty? path [
+        let nxt first path
+        ifelse is-patch? nxt [ set reserved-next nxt ] [
+          set path []
+          set reserved-next nobody
+        ]
+      ]
+    ]
+
+    if enable-battery? and moved? and not system-done? [
+      set battery battery - battery-drain-per-tick
+      if battery < 0 [ set battery 0 ]
+    ]
+  ]
+end
+
+; ==========================================================
+; BROKEN / DEAD
+; ==========================================================
+to become-broken
+  if member? mstate ["broken" "dead"] [ stop ]
+  set mstate "broken"
+  set broken-queue lput self broken-queue
+  pull-over
+end
+
+to become-dead
+  if mstate = "dead" [ stop ]
+  set mstate "dead"
+  set dead-queue lput self dead-queue
+  pull-over
+end
+
+to pull-over
+  let opts patches in-radius 6 with [
+    not wall? and celltype = "floor" and not any? turtles-here
+  ]
+  ifelse any? opts [
+    safe-move-to (min-one-of opts [distance myself])
+  ] [
+    let s safe-one-of-patches (neighbors4 with [not wall? and not any? turtles-here])
+    if s != nobody [ safe-move-to s ]
+  ]
+end
+
+; ==========================================================
+; TOW SYSTEM
+; ==========================================================
+to move-repair-tows
+  ask repair-tows [
+    if system-done? [ stop ]
+
+    if tstate = "idle" [
+      if any? (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "broken"] [
+        set broken-queue remove-duplicates
+          (sentence broken-queue [self] of
+            (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "broken"])
+      ]
+
+      if not empty? broken-queue [
+        let t first broken-queue
+        set broken-queue but-first broken-queue
+        if is-vehicle? t and ([mstate] of t = "broken") [
+          set target-truck t
+          set goal2 [patch-here] of t
+          set path2 find-path patch-here goal2
+          set tstate "to-truck"
+        ]
+      ]
+      stop
+    ]
+
+    if tstate = "to-truck" [
+      if (target-truck = nobody) or
+         (not is-vehicle? target-truck) or
+         ([mstate] of target-truck != "broken")
+      [
+        set tstate "idle"
+        set path2 []
+        set target-truck nobody
+        stop
+      ]
+      set goal2 [patch-here] of target-truck
+      if empty? path2 [ set path2 find-path patch-here goal2 ]
+      tow-step-safe
+      if patch-here = goal2 [
+        ask target-truck [ set mstate "towed-to-service" ]
+        set goal2 safe-one-of-patches service-stations
+        set path2 find-path patch-here goal2
+        set tstate "to-service"
+      ]
+      stop
+    ]
+
+    if tstate = "to-service" [
+      if empty? path2 [ set path2 find-path patch-here goal2 ]
+      tow-step-safe
+
+      if target-truck != nobody and is-vehicle? target-truck [
+        ask target-truck [ safe-move-to [patch-here] of myself ]
+      ]
+
+      if patch-here = goal2 [
+        if target-truck != nobody and is-vehicle? target-truck [
+          ask target-truck [
+            safe-move-to (safe-one-of-patches service-stations)
+            set mstate "servicing"
+            set service-left service-time
+          ]
+        ]
+        set tstate "idle"
+        set target-truck nobody
+        set goal2 nobody
+        set path2 []
+      ]
+      stop
+    ]
+  ]
+end
+
+to move-charge-tows
+  ask charge-tows [
+    if system-done? [ stop ]
+
+    if tstate = "idle" [
+      if any? (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "dead"] [
+        set dead-queue remove-duplicates
+          (sentence dead-queue [self] of
+            (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "dead"])
+      ]
+
+      if not empty? dead-queue [
+        let t first dead-queue
+        set dead-queue but-first dead-queue
+        if is-vehicle? t and ([mstate] of t = "dead") [
+          set target-truck t
+          set goal2 [patch-here] of t
+          set path2 find-path patch-here goal2
+          set tstate "to-truck"
+        ]
+      ]
+      stop
+    ]
+
+    if tstate = "to-truck" [
+      if (target-truck = nobody) or
+         (not is-vehicle? target-truck) or
+         ([mstate] of target-truck != "dead")
+      [
+        set tstate "idle"
+        set path2 []
+        set target-truck nobody
+        stop
+      ]
+      set goal2 [patch-here] of target-truck
+      if empty? path2 [ set path2 find-path patch-here goal2 ]
+      tow-step-safe
+      if patch-here = goal2 [
+        ask target-truck [ set mstate "towed-to-charge" ]
+        set goal2 safe-one-of-patches charge-stations
+        set path2 find-path patch-here goal2
+        set tstate "to-charge"
+      ]
+      stop
+    ]
+
+    if tstate = "to-charge" [
+      if empty? path2 [ set path2 find-path patch-here goal2 ]
+      tow-step-safe
+
+      if target-truck != nobody and is-vehicle? target-truck [
+        ask target-truck [ safe-move-to [patch-here] of myself ]
+      ]
+
+      if patch-here = goal2 [
+        if target-truck != nobody and is-vehicle? target-truck [
+          ask target-truck [
+            safe-move-to (safe-one-of-patches charge-stations)
+            set mstate "charging"
+            set charge-left charge-time
+            set battery battery-max
+          ]
+        ]
+        set tstate "idle"
+        set target-truck nobody
+        set goal2 nobody
+        set path2 []
+      ]
+      stop
+    ]
+  ]
+end
+
+; ==========================================================
+; RESTORE JOB AFTER SERVICE/CHARGE
+; ==========================================================
+to restore-vehicle-job
+  set reserved-next nobody
+  set blocked-steps 0
+  set goal-patch nobody
+  set path []
+
+  if member? mstate ["broken" "dead" "towed-to-service" "towed-to-charge" "parked"] [ stop ]
+
+  if breed = inbound-trucks [
+    ifelse inbound-pallets-left > 0 [ set mstate "to-infeed" ] [
+      set mstate "idle"
+      set carry? false
+    ]
+    stop
+  ]
+
+  if breed = carriers [
+    ifelse carry? [
+      let out safe-one-of-patches outfeed-bays
+      ifelse out != nobody [
+        set goal-patch out
+        set path find-path patch-here goal-patch
+        set mstate "to-outfeed"
+      ] [
+        set carry? false
+        set mstate "idle"
+      ]
+    ] [
+      set mstate "idle"
+    ]
+    stop
+  ]
+
+  if breed = transfer-cars [
+    ifelse carry? [
+      let dst safe-one-of-patches (ready-zone with [items < max-items-per-patch])
+      ifelse dst != nobody [
+        set goal-patch dst
+        set path find-path patch-here goal-patch
+        set mstate "to-ready"
+      ] [
+        set carry? false
+        set mstate "idle"
+      ]
+    ] [
+      set mstate "idle"
+    ]
+    stop
+  ]
+
+  set mstate "idle"
+end
+
+; ==========================================================
+; SERVICE & CHARGE TIMERS
+; ==========================================================
+to service-and-charge-timers
+  ask (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "servicing"] [
+    set service-left service-left - 1
+    if service-left <= 0 [
+      set service-left 0
+      set battery battery-max
+      set mstate "idle"
+      restore-vehicle-job
+    ]
+  ]
+
+  if system-done? [
+    ask (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "charging"] [
+      set charge-left 999999
+      set battery battery-max
+    ]
+    stop
+  ]
+
+  ask (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "charging"] [
+    set charge-left charge-left - 1
+    if charge-left <= 0 [
+      set charge-left 0
+      set battery battery-max
+      set mstate "idle"
+      restore-vehicle-job
+    ]
+  ]
+end
+
+; ==========================================================
+; DONE? + SHUTDOWN
+; ==========================================================
+to-report system-done?
+  let eff-target effective-delivery-target
+  if eff-target > 0 and deliveries >= eff-target [ report true ]
+
+  if inbound-pallets-left > 0 [ report false ]
+  if any? blue-zone with [items > 0] [ report false ]
+  if any? ready-zone with [items > 0] [ report false ]
+  if any? (turtle-set inbound-trucks carriers transfer-cars) with [carry?] [ report false ]
+
+  report true
+end
+
+to finish-and-shutdown
+  ask (turtle-set inbound-trucks carriers transfer-cars) with [
+    not member? mstate ["charging" "parked" "broken" "dead"
+                        "towed-to-service" "towed-to-charge" "servicing"]
+  ] [
+    let cs one-of charge-lot with [not any? turtles-here]
+    ifelse cs != nobody [
+      set goal-patch cs
+      set path find-path patch-here goal-patch
+      set mstate "to-charge-home"
+    ] [
+      set mstate "parked"
+      set path []
+      set reserved-next nobody
+    ]
+  ]
+
+  ask (turtle-set inbound-trucks carriers transfer-cars) [
+    if mstate = "to-charge-home" and goal-patch != nobody [
+      if patch-here = goal-patch [
+        set mstate "charging"
+        set charge-left 999999
+        set battery battery-max
+        set path []
+        set reserved-next nobody
+      ]
+    ]
+  ]
+
+  ask (turtle-set inbound-trucks carriers transfer-cars) with [
+    member? mstate ["broken" "dead" "towed-to-service" "towed-to-charge" "servicing"]
+  ] [
+    set mstate "parked"
+    set path []
+    set reserved-next nobody
+    set battery battery-max
+  ]
+
+  ask humans with [mstate != "resting"] [
+    if [celltype] of patch-here != "rest" [
+      let rest-patch safe-one-of-patches (toilet-zone with [not any? turtles-here])
+      if rest-patch != nobody [ safe-move-to rest-patch ]
+    ]
+    set mstate "resting"
+  ]
+end
+
+; ==========================================================
+; APPEARANCE
+; ==========================================================
+to update-vehicle-appearance
+  ifelse mstate = "broken" [
+    set shape "x"
+    set color red
+    set label "B"
+    set label-color white
+  ] [
+    ifelse mstate = "dead" [
+      set shape "face sad"
+      set color gray
+      set label "D"
+      set label-color black
+    ] [
+      ifelse breed = transfer-cars [
+        set shape "car"
+        ifelse carry? [ set color cyan ] [ set color gray ]
+        set label "T"
+      ] [
+        set shape "truck"
+        ifelse breed = inbound-trucks [
+          set color red
+          set label "IN"
+        ] [
+          set color green
+          ifelse carry? [ set label "OUT*" ] [ set label "OUT" ]
+        ]
+      ]
+      set label-color black
+    ]
+  ]
+end
+
+; ==========================================================
+; SAFE HELPERS
+; ==========================================================
+to safe-move-to [dest]
+  if (dest = nobody) or (not is-patch? dest) [ stop ]
+  move-to dest
+end
+
+to-report safe-one-of-patches [pset]
+  if pset = nobody [ report nobody ]
+  if not any? pset [ report nobody ]
+  report one-of pset
+end
+
+to-report is-vehicle? [t]
+  if t = nobody [ report false ]
+  if not is-turtle? t [ report false ]
+  report member? [breed] of t (list inbound-trucks carriers transfer-cars)
+end
+
+to-report is-stopped-vehicle? [t]
+  if not is-vehicle? t [ report false ]
+  let s [mstate] of t
+  report member? s ["broken" "dead" "towed-to-service" "towed-to-charge"
+                    "servicing" "charging" "parked"]
+end
+
+to step-along-path-safe
+  if (path = nobody) or empty? path [ set path [] stop ]
+  let nxt first path
+  if (nxt = nobody) or (not is-patch? nxt) [ set path [] stop ]
+  if [wall?] of nxt [ set path [] stop ]
+  if not any? turtles-on nxt [
+    safe-move-to nxt
+    set path but-first path
+  ]
+end
+
+to tow-step-safe
+  if (path2 = nobody) or empty? path2 [ set path2 [] stop ]
+  let nxt first path2
+  if (nxt = nobody) or (not is-patch? nxt) [ set path2 [] stop ]
+  if [wall?] of nxt [ set path2 [] stop ]
+
+  ifelse (not any? turtles-on nxt) or (nxt = goal2) [
+    safe-move-to nxt
+    set path2 but-first path2
+    set blocked2 0
+  ] [
+    set blocked2 blocked2 + 1
+    let side safe-one-of-patches (neighbors4 with [not wall? and not any? turtles-here])
+    if side != nobody [ safe-move-to side ]
+    if blocked2 > 6 and goal2 != nobody [
+      set path2 find-path patch-here goal2
+      set blocked2 0
+    ]
+  ]
+end
+
+to-report occurrences [target lst]
+  report length filter [x -> x = target] lst
+end
+
+; ==========================================================
+; PATHFINDING (BFS)
+; ==========================================================
+to-report find-path [start goal]
+  if start = nobody or goal = nobody [ report [] ]
+  if not is-patch? start or not is-patch? goal [ report [] ]
+  if start = goal [ report [] ]
+
+  let frontier (list start)
+  let visited (list start)
+  let parents []
+
+  while [not empty? frontier] [
+    let current first frontier
+    set frontier but-first frontier
+
+    if current = goal [
+      report reconstruct-path start goal parents
+    ]
+
+    let nbrs [neighbors4] of current
+    foreach sort nbrs [n ->
+      if (not member? n visited) and (not [wall?] of n) [
+        set visited lput n visited
+        set frontier lput n frontier
+        set parents lput (list n current) parents
+      ]
+    ]
+  ]
+  report []
+end
+
+to-report reconstruct-path [start goal parents]
+  let path-list (list goal)
+  let current goal
+
+  while [current != start] [
+    let matches filter [pr -> first pr = current] parents
+    if empty? matches [ report [] ]
+    let pair first matches
+    let parent last pair
+    set current parent
+    if current != start [
+      set path-list fput current path-list
+    ]
+  ]
+  report path-list
+end
+
+; ==========================================================
+; CONGESTION REPORTERS + MONITOR UPDATER
+; ==========================================================
+to-report active-movers
+  report (turtle-set inbound-trucks carriers transfer-cars) with [
+    not member? mstate ["broken" "dead" "towed-to-service" "towed-to-charge"
+                        "servicing" "charging" "parked"]
+  ]
+end
+
+to-report mean-blocked
+  let ms active-movers
+  if not any? ms [ report 0 ]
+  report mean [blocked-steps] of ms
+end
+
+to-report max-blocked
+  let ms active-movers
+  if not any? ms [ report 0 ]
+  report max [blocked-steps] of ms
+end
+
+to update-monitors
+  set mean-blocked-now mean-blocked
+  set max-blocked-now  max-blocked
+end
+
+; ==========================================================
+; PUBLISH / DIAGNOSTICS REPORTERS
+; ==========================================================
+to-report mean-lead-time
+  if empty? lead-times [ report 0 ]
+  report mean lead-times
+end
+
+to-report median-lead-time
+  if empty? lead-times [ report 0 ]
+  report median lead-times
+end
+
+to-report p90-lead-time
+  if empty? lead-times [ report 0 ]
+  let s sort lead-times
+  let idx floor ((length s - 1) * 0.9)
+  if idx < 0 [ set idx 0 ]
+  report item idx s
+end
+
+to-report pct-moved-by-humans
+  let total (moved-by-humans + moved-by-transfer)
+  if total <= 0 [ report 0 ]
+  report 100 * moved-by-humans / total
+end
+
+to-report pct-moved-by-transfer
+  let total (moved-by-humans + moved-by-transfer)
+  if total <= 0 [ report 0 ]
+  report 100 * moved-by-transfer / total
+end
+
+to-report pallet-balance-error
+  let blue-items 0
+  let ready-items 0
+  if blue-zone != nobody  [ set blue-items sum [items] of blue-zone ]
+  if ready-zone != nobody [ set ready-items sum [items] of ready-zone ]
+  let carried count turtles with [carry?]
+  report initial-pallets - (inbound-pallets-left + blue-items + ready-items + carried + deliveries)
+end]]></code>
+  <widgets>
+    <view x="366" wrappingAllowedX="true" y="56" frameRate="30" minPycor="-16" height="438" showTickCounter="true" patchSize="13" fontSize="10" wrappingAllowedY="true" width="437" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <button x="370" y="5" height="49" disableUntilTicks="false" forever="false" kind="Observer" width="75" display="setup">setup</button>
+    <button x="450" y="4" height="51" disableUntilTicks="false" forever="true" kind="Observer" width="80" display="go">go</button>
+    <button x="535" y="4" height="51" disableUntilTicks="false" forever="false" kind="Observer" width="75" display="reset-ticks">reset-ticks</button>
+    <slider x="0" step="1" y="270" max="6" width="360" display="robot-speed" height="54" min="1" direction="Horizontal" default="2" variable="robot-speed"></slider>
+    <slider x="0" step="0.01" y="330" max="0.2" width="360" display="collision-prob" height="50" min="0" direction="Horizontal" default="0.01" variable="collision-prob"></slider>
+    <slider x="0" step="100" y="210" max="50000" width="360" display="max-ticks" height="54" min="0" direction="Horizontal" default="0" variable="max-ticks"></slider>
+    <slider x="0" step="1" y="90" max="20" width="360" display="max-items-per-patch" height="54" min="1" direction="Horizontal" default="6" variable="max-items-per-patch"></slider>
+    <slider x="0" step="1" y="150" max="10" width="360" display="sort-time" height="54" min="1" direction="Horizontal" default="2" variable="sort-time"></slider>
+    <slider x="0" step="1" y="385" max="10" width="360" display="inbound-unload-time" height="50" min="1" direction="Horizontal" default="3" variable="inbound-unload-time"></slider>
+    <slider x="0" step="50" y="30" max="2000" width="360" display="inbound-pallets-left" height="54" min="0" direction="Horizontal" default="249" variable="inbound-pallets-left"></slider>
+    <note x="0" y="0" backgroundDark="0" fontSize="20" width="160" markdown="false" height="29" textColorDark="-1" textColorLight="-1572864" backgroundLight="786588">RUN CONTROL</note>
+    <slider x="524" step="1" y="599" max="50" width="250" display="target-loss-count" height="54" min="0" direction="Horizontal" default="4" variable="target-loss-count"></slider>
+    <slider x="521" step="50" y="541" max="5000" width="250" display="deliveries-target" height="50" min="0" direction="Horizontal" default="200" variable="deliveries-target"></slider>
+    <note x="506" y="490" backgroundDark="0" fontSize="20" width="217" markdown="false" height="60" textColorDark="-1" textColorLight="-6422273" backgroundLight="0">TARGET SETTINGS</note>
+    <plot x="812" autoPlotX="true" yMax="10" autoPlotY="true" y="560" xMin="0" height="182" legend="true" xMax="10" yMin="0" width="331" display="Human Utilization">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="working" color="-16116700" legend="true">
+        <setup></setup>
+        <update>plot count humans with [mstate != "resting"]
+</update>
+      </pen>
+      <pen interval="1" mode="0" display="resting" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot count humans with [mstate = "resting"]</update>
+      </pen>
+      <pen interval="1" mode="0" display="carrying" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot count humans with [carry?]</update>
+      </pen>
+    </plot>
+    <plot x="1158" autoPlotX="true" yMax="10" autoPlotY="true" y="562" xMin="0" height="182" legend="true" xMax="10" yMin="0" width="341" display="Delivery progress">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="delivered" color="-14136696" legend="true">
+        <setup></setup>
+        <update>plot deliveries</update>
+      </pen>
+      <pen interval="1" mode="0" display="eff-target" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot effective-delivery-target</update>
+      </pen>
+    </plot>
+    <plot x="804" autoPlotX="true" yMax="10" autoPlotY="true" y="383" xMin="0" height="170" legend="true" xMax="10" yMin="0" width="342" display="Fleet status">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="active" color="-15051147" legend="true">
+        <setup></setup>
+        <update>plot count active-movers</update>
+      </pen>
+      <pen interval="1" mode="0" display="charging" color="-13840069" legend="true">
+        <setup></setup>
+        <update>plot count (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "charging"]</update>
+      </pen>
+      <pen interval="1" mode="0" display="broken-dead" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot count (turtle-set inbound-trucks carriers transfer-cars) with [member? mstate ["broken" "dead"]]</update>
+      </pen>
+    </plot>
+    <plot x="1165" autoPlotX="true" yMax="10" autoPlotY="true" y="378" xMin="0" height="177" legend="true" xMax="10" yMin="0" width="340" display="WIP">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="blue-items" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot sum [items] of blue-zone</update>
+      </pen>
+      <pen interval="1" mode="0" display="ready-items" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot sum [items] of ready-zone</update>
+      </pen>
+      <pen interval="1" mode="0" display="carrying" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot count (turtle-set inbound-trucks carriers transfer-cars) with [carry?]</update>
+      </pen>
+    </plot>
+    <plot x="803" autoPlotX="true" yMax="10" autoPlotY="true" y="210" xMin="0" height="170" legend="false" xMax="10" yMin="0" width="336" display="Congestion">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="mean-blocked" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot mean-blocked</update>
+      </pen>
+      <pen interval="1" mode="0" display="max-blocked" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot max-blocked</update>
+      </pen>
+    </plot>
+    <plot x="1159" autoPlotX="true" yMax="100" autoPlotY="false" y="206" xMin="0" height="170" legend="true" xMax="10" yMin="0" width="344" display="Target progress (%)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="progress%" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot (ifelse-value (effective-delivery-target = 0) [0] [100 * deliveries / effective-delivery-target])</update>
+      </pen>
+      <pen interval="1" mode="0" display="100%" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plot 100</update>
+      </pen>
+    </plot>
+    <plot x="1155" autoPlotX="true" yMax="10" autoPlotY="true" y="17" xMin="0" height="188" legend="true" xMax="10" yMin="0" width="339" display="Battery">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="mean-battery" color="-13345367" legend="true">
+        <setup></setup>
+        <update>if enable-battery? and any? (turtle-set inbound-trucks carriers transfer-cars) [ plot mean [battery] of (turtle-set inbound-trucks carriers transfer-cars) ]</update>
+      </pen>
+      <pen interval="1" mode="0" display="min-battery" color="-2674135" legend="true">
+        <setup></setup>
+        <update>if enable-battery? and any? (turtle-set inbound-trucks carriers transfer-cars) [ plot min [battery] of (turtle-set inbound-trucks carriers transfer-cars) ]</update>
+      </pen>
+    </plot>
+    <plot x="802" autoPlotX="true" yMax="10" autoPlotY="true" y="27" xMin="0" height="183" legend="true" xMax="10" yMin="0" width="335" display="Tow &amp; queues">
+      <setup></setup>
+      <update></update>
+      <pen interval="1" mode="0" display="broken-queue" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot length broken-queue</update>
+      </pen>
+      <pen interval="1" mode="0" display="dead-queue" color="-14796697" legend="true">
+        <setup></setup>
+        <update>plot length dead-queue</update>
+      </pen>
+      <pen interval="1" mode="0" display="tows-busy" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot (count repair-tows with [tstate != "idle"] + count charge-tows with [tstate != "idle"])</update>
+      </pen>
+    </plot>
+    <note x="804" y="0" backgroundDark="0" fontSize="20" width="252" markdown="false" height="25" textColorDark="-1" textColorLight="-13627400" backgroundLight="0">PERFORMANCE GRAPHS</note>
+    <slider x="803" step="1" y="802" max="50" width="236" display="num-inbound-trucks" height="54" min="0" direction="Horizontal" default="10" variable="num-inbound-trucks"></slider>
+    <slider x="1054" step="1" y="801" max="50" width="249" display="num-carriers" height="56" min="0" direction="Horizontal" default="15" variable="num-carriers"></slider>
+    <slider x="1309" step="1" y="800" max="50" width="208" display="num-transfer-cars" height="54" min="0" direction="Horizontal" default="6" variable="num-transfer-cars"></slider>
+    <slider x="798" step="1" y="866" max="10" width="246" display="num-repair-tows" height="56" min="0" direction="Horizontal" default="4" variable="num-repair-tows"></slider>
+    <slider x="1057" step="1" y="861" max="50" width="249" display="num-humans" height="60" min="0" direction="Horizontal" default="8" variable="num-humans"></slider>
+    <slider x="1311" step="1" y="860" max="10" width="209" display="num-charge-tows" height="57" min="0" direction="Horizontal" default="2" variable="num-charge-tows"></slider>
+    <note x="796" y="756" backgroundDark="0" fontSize="20" width="165" markdown="false" height="44" textColorDark="-1" textColorLight="-65444" backgroundLight="0">FLEET SIZE</note>
+    <note x="530" y="655" backgroundDark="0" fontSize="20" width="150" markdown="false" height="39" textColorDark="-1" textColorLight="-15582384" backgroundLight="0">Reproducibility</note>
+    <switch x="535" y="690" height="40" on="false" variable="use-fixed-seed?" width="235" display="use-fixed-seed?"></switch>
+    <slider x="535" step="1" y="735" max="100000" width="250" display="seed" height="50" min="0" direction="Horizontal" default="12345" variable="seed"></slider>
+    <switch x="3" y="501" height="40" on="true" variable="enable-battery?" width="124" display="enable-battery?"></switch>
+    <note x="0" y="470" backgroundDark="0" fontSize="20" width="175" markdown="false" height="39" textColorDark="-1" textColorLight="-15575016" backgroundLight="0"><![CDATA[Battery&Charge]]></note>
+    <switch x="0" y="542" height="40" on="true" variable="enable-collisions?" width="134" display="enable-collisions?"></switch>
+    <slider x="135" step="1" y="510" max="20" width="186" display="charge-time" height="65" min="5" direction="Horizontal" default="2" variable="charge-time"></slider>
+    <slider x="323" step="5" y="511" max="200" width="193" display="service-time" height="61" min="5" direction="Horizontal" default="35" variable="service-time"></slider>
+    <slider x="0" step="1" y="579" max="20" width="268" display="battery-drain-per-tick" height="50" min="0" direction="Horizontal" default="2" variable="battery-drain-per-tick"></slider>
+    <slider x="271" step="100" y="579" max="5000" width="243" display="battery-max" height="54" min="200" direction="Horizontal" default="2000" variable="battery-max"></slider>
+    <chooser x="1" y="661" height="60" variable="mouse-tool" current="0" width="208" display="mouse-tool">
+      <choice type="string" value="none"></choice>
+      <choice type="string" value="toggle-wall"></choice>
+      <choice type="string" value="add-items-blue"></choice>
+      <choice type="string" value="remove-items"></choice>
+      <choice type="string" value="add-inbound"></choice>
+      <choice type="string" value="add-transfer"></choice>
+      <choice type="string" value="add-carrier"></choice>
+      <choice type="string" value="break-vehicle"></choice>
+      <choice type="string" value="kill-battery"></choice>
+      <choice type="string" value="repair-now"></choice>
+      <choice type="string" value="charge-now"></choice>
+    </chooser>
+    <note x="0" y="631" backgroundDark="0" fontSize="20" width="150" markdown="false" height="39" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Chooser</note>
+    <monitor x="140" precision="17" y="750" height="75" fontSize="18" width="165" display="Ready Inventory">sum [items] of ready-zone</monitor>
+    <monitor x="300" precision="17" y="754" height="72" fontSize="18" width="120" display="Delivered">Deliveries</monitor>
+    <monitor x="420" precision="17" y="750" height="70" fontSize="18" width="115" display="Target">deliveries-target</monitor>
+    <monitor x="0" precision="17" y="744" height="82" fontSize="18" width="140" display="Blue Inventory">sum [items] of blue-zone</monitor>
+    <monitor x="0" precision="17" y="824" height="68" fontSize="18" width="120" display="Initial Pallets">initial-pallets</monitor>
+    <monitor x="245" precision="17" y="820" height="71" fontSize="18" width="130" display="Left Pallets">inbound-pallets-left</monitor>
+    <monitor x="380" precision="17" y="825" height="69" fontSize="18" width="160" display="charging vehicles">count (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "charging"]</monitor>
+    <monitor x="115" precision="17" y="825" height="65" fontSize="14" width="132" display="Broken Vehicles">count (turtle-set inbound-trucks carriers transfer-cars) with [mstate = "broken"]</monitor>
+    <note x="0" y="720" backgroundDark="0" fontSize="24" width="250" markdown="false" height="44" textColorDark="-1" textColorLight="-16777216" backgroundLight="16120320"><![CDATA[KPIs &amp; Performance]]></note>
+    <monitor x="585" precision="17" y="850" height="79" fontSize="18" width="160" display="% Of Target">ifelse-value deliveries-target = 0 [0] [ 100 * deliveries / deliveries-target ]</monitor>
+    <note x="0" y="884" backgroundDark="0" fontSize="20" width="150" markdown="false" height="39" textColorDark="-1" textColorLight="-10263788" backgroundLight="0">Diagostics</note>
+    <monitor x="0" precision="17" y="919" height="60" fontSize="11" width="100" display="Lead samples">length lead-times</monitor>
+    <monitor x="0" precision="17" y="978" height="60" fontSize="11" width="113" display="Dead queue length">length dead-queue</monitor>
+    <monitor x="101" precision="17" y="977" height="60" fontSize="11" width="100" display="Broken queue length">length broken-queue</monitor>
+    <monitor x="94" precision="17" y="918" height="60" fontSize="11" width="116" display="Lead mean(ticks)">mean-lead-time</monitor>
+    <monitor x="311" precision="17" y="918" height="60" fontSize="11" width="100" display="Lead P90">p90-lead-time</monitor>
+    <monitor x="211" precision="17" y="915" height="60" fontSize="11" width="100" display="Lead median">median-lead-time</monitor>
+    <monitor x="198" precision="17" y="975" height="60" fontSize="11" width="149" display="Pallet Balance Error">pallet-balance-error</monitor>
+    <monitor x="339" precision="17" y="974" height="60" fontSize="11" width="148" display="Human staging motion">moved-by-humans</monitor>
+    <monitor x="5" precision="17" y="1038" height="60" fontSize="11" width="152" display="%Staged by humans">pct-moved-by-humans</monitor>
+    <monitor x="155" precision="17" y="1038" height="60" fontSize="11" width="149" display="Transfer Staging moves">moved-by-transfer</monitor>
+    <monitor x="305" precision="17" y="1038" height="60" fontSize="11" width="137" display="%Staged by transfers">pct-moved-by-transfer</monitor>
+    <monitor x="515" precision="17" y="975" height="60" fontSize="11" width="145" display="Max blocked">max-blocked-now</monitor>
+    <monitor x="661" precision="17" y="975" height="60" fontSize="11" width="126" display="Mean blocked">mean-blocked-now</monitor>
+    <note x="521" y="931" backgroundDark="0" fontSize="20" width="150" markdown="false" height="39" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Congestion</note>
+    <note x="625" y="805" height="60" fontSize="20" width="180" markdown="false" textColorLight="-589824" backgroundLight="0">Target</note>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0"></dash>
+          <dash value="1"></dash>
+        </line>
+        <line x="0" visible="true">
+          <dash value="1"></dash>
+          <dash value="0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0"></dash>
+          <dash value="1"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>
