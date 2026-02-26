@@ -52,7 +52,7 @@ The model includes:
 
 ## 🏭 Warehouse Zones
 
-![Work Layout](work-layout.png)
+![Work Layout](Work-Layout.png)
 
 The warehouse layout includes:
 
@@ -94,7 +94,7 @@ If collisions or battery depletion occur, vehicles may be queued, towed, repaire
 
 ## 🧠 System Architecture & Execution Model
 
-![System architecture](Systemarchitecture.png)
+![System Architecture](System-architecture.png)
 
 The warehouse simulation is structured as a layered, agent-based system running on the NetLogo Web runtime (single execution thread with logical concurrency).
 
@@ -339,7 +339,7 @@ Another important business insight is that **reliability affects flow beyond the
 ![Fleet Status](fleet-status.png)
 
 ### 📦 Work In Progress (WIP)
-![WIP](Work in Progress.png)
+![WIP](Work-in-progess.png)
 
 ### 👷 Human Utilization
 ![Human Utilization](human-utilization.png)
