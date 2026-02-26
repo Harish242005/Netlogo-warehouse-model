@@ -94,7 +94,7 @@ If collisions or battery depletion occur, vehicles may be queued, towed, repaire
 
 ## 🧠 System Architecture & Execution Model
 
-![System Architecture](System architecture.pngg)
+![System Architecture](System architecture.png)
 
 The warehouse simulation is structured as a layered, agent-based system running on the NetLogo Web runtime (single execution thread with logical concurrency).
 
